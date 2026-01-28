@@ -19,3 +19,104 @@ while True:
 
 cap.release()
 cv2.destroyAllWindows()
+
+
+
+-----------------------------------------------------------------------------
+
+✅ METHOD 1 (EASIEST): Search using File Explorer
+
+Press Windows + E
+
+Open This PC
+
+In the search box (top-right), type:
+
+yolov8n.pt
+
+
+Wait 10–30 seconds
+
+👉 If it appears → file exists
+👉 If nothing shows → file NOT present
+
+✅ METHOD 2: Check via Command Prompt (RECOMMENDED)
+
+Open CMD and type:
+
+where /r C:\ yolov8n.pt
+
+Result meanings:
+
+Shows a path like:
+
+C:\Users\Public\yolo\yolov8n.pt
+
+
+✅ File exists
+
+Says:
+
+INFO: Could not find files
+
+
+❌ File not present anywhere on C drive
+
+⚠️ This command does not use internet.
+
+✅ METHOD 3: Check in your project folder
+
+If your script is here:
+
+C:\Users\This PC\Desktop\yolo\rtsp-security-cam
+
+
+Run:
+
+dir yolov8n.pt
+
+
+If listed → ✅ present
+
+If “File Not Found” → ❌ not there
+
+✅ METHOD 4: Check via Python (VERY CLEAR)
+
+Run this in CMD:
+
+python -c "import os; print(os.path.exists('yolov8n.pt'))"
+
+
+Output:
+
+True → file exists in current folder
+
+False → file not in this folder
+
+To search entire drive (slow but sure):
+
+python - <<EOF
+import os
+for root, dirs, files in os.walk("C:\\"):
+    if "yolov8n.pt" in files:
+        print(os.path.join(root, "yolov8n.pt"))
+EOF
+
+🔴 IMPORTANT NOTE
+
+If yolov8n.pt is NOT present, then:
+
+YOLO cannot detect anything
+
+No boxes will appear
+
+Program may still run (webcam opens) but no detection
+
+This exactly matches what you experienced earlier.
+
+
+
+
+
+
+
