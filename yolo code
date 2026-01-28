@@ -19,8 +19,38 @@ while True:
 
 cap.release()
 cv2.destroyAllWindows()
+-----------------------------------------------------------------------------
 
 
+⚡ GPU-OPTIMIZED WEBCAM / RTSP CODE
+
+Use this version 👇
+
+import cv2
+from ultralytics import YOLO
+import torch
+
+print("CUDA:", torch.cuda.is_available())
+
+model = YOLO("yolov8n.pt").to("cuda")
+
+cap = cv2.VideoCapture(0)
+cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    results = model(frame, conf=0.3, device=0, verbose=False)
+    output = results[0].plot()
+
+    cv2.imshow("YOLO GPU", output)
+    if cv2.waitKey(1) == 27:
+        break
+
+cap.release()
+cv2.destroyAllWindows()
 
 -----------------------------------------------------------------------------
 
@@ -114,7 +144,445 @@ Program may still run (webcam opens) but no detection
 
 This exactly matches what you experienced earlier.
 
+------------------------------------------------------------------------
 
+
+# Copyright (c) 2023, Phazer Tech
+# All rights reserved.
+
+# View the GNU AFFERO license found in the
+# LICENSE file in the root directory.
+
+import time
+import os
+import sys
+import cv2
+import queue
+import threading
+import numpy as np
+from datetime import datetime
+from ffmpeg import FFmpeg
+from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter, BooleanOptionalAction
+from sshkeyboard import listen_keyboard, stop_listening
+from ultralytics import YOLO
+
+# ------------------- ARGUMENTS -------------------
+parser = ArgumentParser(formatter_class=ArgumentDefaultsHelpFormatter)
+parser.add_argument("--stream", type=str, help="RTSP address of video stream.")
+parser.add_argument('--monitor', default=False, action=BooleanOptionalAction, help="View the live stream.")
+parser.add_argument("--yolo", type=str, help="Comma-separated list of objects to detect from coco.names")
+parser.add_argument("--model", default='yolov8n', type=str, help="YOLO model size. Default is nano.")
+parser.add_argument("--tail_length", default=8, type=int, choices=range(1,30), help="Seconds without object to stop recording.")
+parser.add_argument("--auto_delete", default=False, action=BooleanOptionalAction, help="Delete short recordings automatically.")
+parser.add_argument('--testing', default=False, action=BooleanOptionalAction, help="Testing mode disables recording and prints detection info.")
+args = vars(parser.parse_args())
+
+# ------------------- CONFIG -------------------
+rtsp_stream = args["stream"]
+monitor = args["monitor"]
+tail_length = args["tail_length"]
+auto_delete = args["auto_delete"]
+testing = args["testing"]
+
+# YOLO setup
+if args["yolo"]:
+    yolo_list = [s.strip() for s in args["yolo"].split(",")]
+    yolo_on = True
+else:
+    yolo_on = False
+
+if yolo_on:
+    CONFIDENCE = 0.5
+    font_scale = 1
+    thickness = 1
+    labels = open("coco.names").read().strip().split("\n")
+    colors = np.random.randint(0, 255, size=(len(labels), 3), dtype="uint8")
+    model = YOLO(args["model"]+".pt")
+
+    # Validate object names
+    for obj in yolo_list:
+        if obj not in labels:
+            exit(f"Error: '{obj}' not found in coco.names")
+
+# ------------------- CAMERA SETUP -------------------
+cap = cv2.VideoCapture(rtsp_stream)
+fps = cap.get(cv2.CAP_PROP_FPS) or 25
+period = 1 / fps
+ret, img = cap.read()
+if img.shape[1]/img.shape[0] > 1.55:
+    res = (256,144)
+else:
+    res = (216,162)
+
+if monitor:
+    cv2.namedWindow(rtsp_stream, cv2.WINDOW_NORMAL)
+
+# ------------------- SUPPRESS FFMPEG ERRORS -------------------
+class suppress_stdout_stderr(object):
+    def __enter__(self):
+        self.outnull_file = open(os.devnull, 'w')
+        self.errnull_file = open(os.devnull, 'w')
+        self.old_stdout_fileno_undup = sys.stdout.fileno()
+        self.old_stderr_fileno_undup = sys.stderr.fileno()
+        self.old_stdout_fileno = os.dup(sys.stdout.fileno())
+        self.old_stderr_fileno = os.dup(sys.stderr.fileno())
+        self.old_stdout = sys.stdout
+        self.old_stderr = sys.stderr
+        os.dup2(self.outnull_file.fileno(), self.old_stdout_fileno_undup)
+        os.dup2(self.errnull_file.fileno(), self.old_stderr_fileno_undup)
+        sys.stdout = self.outnull_file
+        sys.stderr = self.errnull_file
+        return self
+    def __exit__(self, *_):
+        sys.stdout = self.old_stdout
+        sys.stderr = self.old_stderr
+        os.dup2(self.old_stdout_fileno, self.old_stdout_fileno_undup)
+        os.dup2(self.old_stderr_fileno, self.old_stderr_fileno_undup)
+        os.close(self.old_stdout_fileno)
+        os.close(self.old_stderr_fileno)
+        self.outnull_file.close()
+        self.errnull_file.close()
+
+# ------------------- FRAME QUEUE -------------------
+q = queue.Queue()
+
+def receive_frames():
+    global cap
+    while True:
+        ret, frame = cap.read()
+        if ret:
+            q.put(frame)
+        else:
+            print("Camera disconnected. Reconnecting...")
+            while True:
+                with suppress_stdout_stderr():
+                    cap = cv2.VideoCapture(rtsp_stream)
+                if cap.isOpened():
+                    print("Camera reconnected.")
+                    break
+                time.sleep(5)
+
+# ------------------- KEYBOARD INPUT -------------------
+loop = True
+def press(key):
+    global loop
+    if key == 'q':
+        loop = False
+
+def input_keyboard():
+    listen_keyboard(on_press=press)
+
+# ------------------- FFMPEG RECORDING -------------------
+ffmpeg_copy = None
+recording = False
+activity_count = 0
+
+def start_ffmpeg(filename):
+    global ffmpeg_copy
+    try:
+        ffmpeg_copy.execute()
+    except:
+        print("Issue recording the stream. Trying again.")
+        time.sleep(1)
+        ffmpeg_copy.execute()
+
+def stop_ffmpeg():
+    global ffmpeg_copy, recording
+    ffmpeg_copy.terminate()
+    ffmpeg_copy = None
+    recording = False
+
+# ------------------- YOLO PROCESSING -------------------
+def process_yolo(frame):
+    results = model.predict(frame, conf=CONFIDENCE, verbose=False)[0]
+    object_found = False
+
+    for data in results.boxes.data.tolist():
+        xmin, ymin, xmax, ymax, confidence, class_id = data
+        xmin, ymin, xmax, ymax, class_id = map(int, [xmin, ymin, xmax, ymax, class_id])
+        if labels[class_id] in yolo_list:
+            object_found = True
+
+        # Draw bounding box
+        color = [int(c) for c in colors[class_id]]
+        cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), color=color, thickness=thickness)
+        text = f"{labels[class_id]}: {confidence:.2f}"
+        (text_width, text_height) = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, fontScale=font_scale, thickness=thickness)[0]
+        cv2.rectangle(frame, (xmin, ymin - text_height - 5), (xmin + text_width + 2, ymin), color=color, thickness=cv2.FILLED)
+        cv2.putText(frame, text, (xmin, ymin - 5), cv2.FONT_HERSHEY_SIMPLEX, fontScale=font_scale, color=(0,0,0), thickness=thickness)
+
+    return object_found
+
+# ------------------- THREADS -------------------
+receive_thread = threading.Thread(target=receive_frames, daemon=True)
+receive_thread.start()
+keyboard_thread = threading.Thread(target=input_keyboard, daemon=True)
+keyboard_thread.start()
+
+# ------------------- MAIN LOOP -------------------
+while loop:
+    if not q.empty():
+        img = q.get()
+        resized_frame = cv2.resize(img, res)
+        object_found = False
+
+        if yolo_on:
+            object_found = process_yolo(resized_frame)
+
+        # Start recording
+        if object_found and not recording:
+            filedate = datetime.now().strftime('%H-%M-%S')
+            if not testing:
+                folderdate = datetime.now().strftime('%Y-%m-%d')
+                if not os.path.isdir(folderdate):
+                    os.mkdir(folderdate)
+                filename = f'{folderdate}/{filedate}.mkv'
+                ffmpeg_copy = FFmpeg().option("y").input(rtsp_stream, rtsp_transport="tcp", rtsp_flags="prefer_tcp").output(filename, vcodec="copy", acodec="copy")
+                ffmpeg_thread = threading.Thread(target=start_ffmpeg, args=(filename,))
+                ffmpeg_thread.start()
+                print(f"{filedate} recording started")
+            else:
+                print(f"{filedate} recording started - Testing mode")
+            recording = True
+            activity_count = 0
+
+        # Stop recording if no object for tail_length frames
+        if recording and not object_found:
+            activity_count += 1
+            if activity_count >= tail_length:
+                if not testing:
+                    stop_ffmpeg()
+                    ffmpeg_thread.join()
+                    print(f"{filedate} recording stopped")
+                    if auto_delete and os.path.isfile(filename):
+                        recorded_frames = cv2.VideoCapture(filename).get(cv2.CAP_PROP_FRAME_COUNT)
+                        if recorded_frames < tail_length * fps:
+                            os.remove(filename)
+                            print(f"{filename} auto-deleted")
+                else:
+                    print(f"{filedate} recording stopped - Testing mode")
+                recording = False
+                activity_count = 0
+        else:
+            activity_count = 0
+
+        # Display
+        if monitor:
+            cv2.imshow(rtsp_stream, resized_frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                loop = False
+    else:
+        time.sleep(period / 2)
+
+# ------------------- CLEANUP -------------------
+stop_listening()
+if ffmpeg_copy:
+    ffmpeg_copy.terminate()
+    ffmpeg_thread.join()
+cv2.destroyAllWindows()
+print("Exiting")
+
+
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+Perfect! Since you like the OpenCV webcam version, we can adapt the same logic for an RTSP stream.
+
+The key changes for RTSP:
+
+Replace cap = cv2.VideoCapture(0) with cap = cv2.VideoCapture(rtsp_url)
+
+Remove 0 in VideoWriter; we record from the RTSP frames instead.
+
+Everything else stays the same: YOLO runs continuously, recording starts/stops automatically.
+
+Here’s the full RTSP version using OpenCV VideoWriter:
+
+import cv2
+import queue
+import threading
+import numpy as np
+import os
+import time
+from datetime import datetime
+from sshkeyboard import listen_keyboard, stop_listening
+from ultralytics import YOLO
+
+# ------------------- SETTINGS -------------------
+rtsp_url = "rtsp://username:password@192.168.1.100:554/stream"  # Replace with your RTSP URL
+yolo_objects = ["person"]  # Change objects you want to detect
+model_name = "yolov8n"     # YOLOv8 model
+tail_length = 8            # Seconds without object to stop recording
+monitor = True             # Show stream window
+testing = False            # True = don't save video
+auto_delete = False        # Delete very short recordings automatically
+
+# ------------------- YOLO SETUP -------------------
+model = YOLO(f"{model_name}.pt")
+labels = open("coco.names").read().strip().split("\n")
+colors = np.random.randint(0, 255, size=(len(labels), 3), dtype="uint8")
+
+# Validate object names
+for obj in yolo_objects:
+    if obj not in labels:
+        exit(f"Error: '{obj}' not in coco.names")
+
+# ------------------- CAMERA SETUP -------------------
+cap = cv2.VideoCapture(rtsp_url)
+fps = cap.get(cv2.CAP_PROP_FPS) or 25
+period = 1 / fps
+
+ret, img = cap.read()
+if not ret:
+    exit("Cannot read from RTSP stream.")
+frame_height, frame_width = img.shape[:2]
+
+# ------------------- FRAME QUEUE -------------------
+q = queue.Queue()
+
+def receive_frames():
+    global cap
+    while True:
+        ret, frame = cap.read()
+        if ret:
+            q.put(frame)
+        else:
+            print("RTSP stream disconnected. Reconnecting...")
+            while True:
+                cap = cv2.VideoCapture(rtsp_url)
+                if cap.isOpened():
+                    print("RTSP stream reconnected.")
+                    break
+                time.sleep(5)
+
+# ------------------- KEYBOARD -------------------
+loop = True
+def press(key):
+    global loop
+    if key == 'q':
+        loop = False
+
+def input_keyboard():
+    listen_keyboard(on_press=press)
+
+# ------------------- YOLO PROCESSING -------------------
+def process_yolo(frame):
+    results = model.predict(frame, conf=0.5, verbose=False)[0]
+    object_found = False
+
+    for data in results.boxes.data.tolist():
+        xmin, ymin, xmax, ymax, confidence, class_id = map(int, data[:6])
+        label_name = labels[class_id]
+        if label_name in yolo_objects:
+            object_found = True
+
+        color = [int(c) for c in colors[class_id]]
+        cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), color=color, thickness=2)
+        text = f"{label_name}: {confidence:.2f}"
+        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+        cv2.rectangle(frame, (xmin, ymin - th - 5), (xmin + tw, ymin), color=color, thickness=cv2.FILLED)
+        cv2.putText(frame, text, (xmin, ymin - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2)
+
+    return object_found
+
+# ------------------- THREADS -------------------
+receive_thread = threading.Thread(target=receive_frames, daemon=True)
+receive_thread.start()
+
+keyboard_thread = threading.Thread(target=input_keyboard, daemon=True)
+keyboard_thread.start()
+
+# ------------------- RECORDING VARIABLES -------------------
+recording = False
+activity_count = 0
+out = None
+
+# ------------------- MAIN LOOP -------------------
+while loop:
+    if not q.empty():
+        img = q.get()
+        object_found = process_yolo(img) if yolo_objects else False
+
+        # Start recording
+        if object_found and not recording:
+            filedate = datetime.now().strftime("%H-%M-%S")
+            folderdate = datetime.now().strftime("%Y-%m-%d")
+            if not os.path.isdir(folderdate):
+                os.mkdir(folderdate)
+            filename = f"{folderdate}/{filedate}.avi"
+
+            if not testing:
+                fourcc = cv2.VideoWriter_fourcc(*'XVID')
+                out = cv2.VideoWriter(filename, fourcc, fps, (frame_width, frame_height))
+                print(f"{filedate} recording started")
+            else:
+                print(f"{filedate} recording started - Testing mode")
+
+            recording = True
+            activity_count = 0
+
+        # Stop recording if object disappears for tail_length seconds
+        if recording and not object_found:
+            activity_count += 1
+            if activity_count >= tail_length * fps:
+                recording = False
+                if out:
+                    out.release()
+                    if auto_delete and os.path.isfile(filename):
+                        recorded_frames = cv2.VideoCapture(filename).get(cv2.CAP_PROP_FRAME_COUNT)
+                        if recorded_frames < tail_length * fps:
+                            os.remove(filename)
+                            print(f"{filename} auto-deleted")
+                    out = None
+                print(f"{filedate} recording stopped")
+                activity_count = 0
+        else:
+            activity_count = 0
+
+        # Write frame to video
+        if recording and out:
+            out.write(img)
+
+        # Show monitor
+        if monitor:
+            cv2.imshow("RTSP YOLO", img)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                loop = False
+    else:
+        time.sleep(period / 2)
+
+# ------------------- CLEANUP -------------------
+stop_listening()
+cap.release()
+if out:
+    out.release()
+cv2.destroyAllWindows()
+print("Exiting")
+
+✅ RTSP Version Features
+
+Continuous YOLO detection on RTSP stream.
+
+Records .avi videos when object appears.
+
+Stops recording after tail_length seconds without object.
+
+Monitor shows live RTSP stream + bounding boxes.
+
+Auto-reconnects if RTSP disconnects.
+
+Works on Windows/Linux (OpenCV only).
+
+Press q to quit.
+
+💡 Example run:
+
+python rtsp_yolo.py
+
+
+Change rtsp_url to your camera’s RTSP link.
+
+Change yolo_objects = ["person","car"] to detect multiple objects.
+
+Remove testing=True to actually save recordings.
 
 
 
